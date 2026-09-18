@@ -1,0 +1,46 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model KommoAuth {
+  id           Int      @id @default(1)
+  accessToken  String
+  refreshToken String
+  expiresAt    DateTime
+  updatedAt    DateTime @updatedAt
+}
+
+model Lead {
+  id           Int       @id
+  name         String
+  price        Float     @default(0)
+  statusId     Int
+  pipelineId   Int
+  createdAt    DateTime
+  updatedAt    DateTime  @updatedAt
+  responseTime Int?      // En segundos
+  tags         LeadTag[]
+}
+
+model Tag {
+  id    Int       @id
+  name  String    @unique
+  leads LeadTag[]
+}
+
+model LeadTag {
+  leadId Int
+  tagId  Int
+  lead   Lead @relation(fields: [leadId], references: [id])
+  tag    Tag  @relation(fields: [tagId], references: [id])
+
+  @@id([leadId, tagId])
+}
