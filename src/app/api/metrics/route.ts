@@ -1,7 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { PrismaClient } from '@prisma/client';
-
-const prisma = new PrismaClient();
+import { prisma } from '@/lib/prisma';
 
 const BOT_TAGS = [
   'asesoriamigracion',
@@ -14,55 +12,85 @@ const BOT_TAGS = [
   'asesorialegal',
 ];
 
-// Migration attended statuses
-const MIGRATION_STATUSES = [105235459, 105235467]; // 'migración' y 'migración atendido'
-// Leads without human reply (still in initial contact status)
-const SIN_REPLICA_STATUS = 105235455; // 'Contacto inicial'
+// Pipeline statuses (from Kommo: "Embudo de ventas" id: 13636179)
+const MIGRATION_EN_PROCESO = [105235459];           // 'migración' (en trámite)
+const MIGRATION_COMPLETADO = [105235467];           // 'migración atendido' (cerrado)
+const MIGRATION_STATUSES   = [...MIGRATION_EN_PROCESO, ...MIGRATION_COMPLETADO];
+const LEGAL_EN_PROCESO     = [111279076];           // 'abogado' (en trámite)
+const LEGAL_COMPLETADO     = [111279080];           // 'abogado atendido' (cerrado)
+const LEGAL_STATUSES       = [...LEGAL_EN_PROCESO, ...LEGAL_COMPLETADO];
+const ATTENDED_STATUSES    = [...MIGRATION_STATUSES, ...LEGAL_STATUSES, 105235463];
 
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const fromParam = searchParams.get('from');
-  const toParam = searchParams.get('to');
+  const toParam   = searchParams.get('to');
 
   const from = fromParam ? new Date(fromParam) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-  const to = toParam ? new Date(toParam) : new Date();
+  const to   = toParam   ? new Date(toParam)   : new Date();
 
-  // Convert dates to millisecond timestamps for SQLite comparison
   const fromMs = from.getTime();
-  const toMs = to.getTime();
+  const toMs   = to.getTime();
 
-  // Total leads in range
-  const totalLeads = await prisma.lead.count({
-    where: { createdAt: { gte: new Date(fromMs), lte: new Date(toMs) } }
-  });
+  // Leads NUEVOS en el período (por cuándo contactaron)
+  const dateFilter = { createdAt: { gte: new Date(fromMs), lte: new Date(toMs) } };
 
-  // Tag counts in range
+  // Atendidos en el período (por cuándo fueron atendidos = updatedAt)
+  // Un lead puede haber llegado hace meses y ser atendido hoy
+  const attendedDateFilter = { updatedAt: { gte: new Date(fromMs), lte: new Date(toMs) } };
+
+  // Total leads NUEVOS en el período
+  const totalLeads = await prisma.lead.count({ where: dateFilter });
+
+  // Etiquetas: cuántas solicitudes NUEVAS hubo de cada tipo (por createdAt)
   const tagCounts: Record<string, number> = {};
   for (const tagName of BOT_TAGS) {
-    const count = await prisma.leadTag.count({
-      where: {
-        tag: { name: tagName },
-        lead: {
-          createdAt: { gte: new Date(fromMs), lte: new Date(toMs) }
-        }
-      }
+    tagCounts[tagName] = await prisma.leadTag.count({
+      where: { tag: { name: tagName }, lead: dateFilter }
     });
-    tagCounts[tagName] = count;
   }
 
-  // Atendidos migración
-  const atendidosMigracion = await prisma.lead.count({
+  // En proceso migración: asignados al pipeline pero no cerrados aún
+  const enProcesoMigracion = await prisma.lead.count({
+    where: { statusId: { in: MIGRATION_EN_PROCESO }, ...attendedDateFilter }
+  });
+  // Completados migración: cerrados como "migración atendido"
+  const completadosMigracion = await prisma.lead.count({
+    where: { statusId: { in: MIGRATION_COMPLETADO }, ...attendedDateFilter }
+  });
+  const atendidosMigracion = enProcesoMigracion + completadosMigracion;
+
+  // En proceso legal: asignados al abogado pero no cerrados aún
+  const enProcesoLegal = await prisma.lead.count({
+    where: { statusId: { in: LEGAL_EN_PROCESO }, ...attendedDateFilter }
+  });
+  // Completados legal: cerrados como "abogado atendido"
+  const completadosLegal = await prisma.lead.count({
+    where: { statusId: { in: LEGAL_COMPLETADO }, ...attendedDateFilter }
+  });
+  const atendidosLegal = enProcesoLegal + completadosLegal;
+
+  // En espera TOTAL (backlog acumulado, sin filtro de fecha)
+  // = leads con el tag PERO que nunca avanzaron a status de atención
+  const enEsperaMigracion = await prisma.leadTag.count({
     where: {
-      statusId: { in: MIGRATION_STATUSES },
-      createdAt: { gte: new Date(fromMs), lte: new Date(toMs) }
+      tag: { name: 'asesoriamigracion' },
+      lead: { statusId: { notIn: MIGRATION_STATUSES } },
     }
   });
 
-  // Diálogos sin réplica (leads en estado "Contacto inicial" - sin atención humana)
+  const enEsperaLegal = await prisma.leadTag.count({
+    where: {
+      tag: { name: 'asesorialegal' },
+      lead: { statusId: { notIn: LEGAL_STATUSES } },
+    }
+  });
+
+  // Sin atención humana en el período (leads nuevos que siguen sin derivar)
   const sinReplica = await prisma.lead.count({
     where: {
-      statusId: SIN_REPLICA_STATUS,
-      createdAt: { gte: new Date(fromMs), lte: new Date(toMs) }
+      statusId: { notIn: ATTENDED_STATUSES },
+      ...dateFilter,
     }
   });
 
@@ -77,13 +105,19 @@ export async function GET(request: NextRequest) {
     ORDER BY day ASC
   `;
 
-  // Total in DB (all time approximation)
   const totalInDB = await prisma.lead.count();
 
   return NextResponse.json({
     period: { from: from.toISOString(), to: to.toISOString() },
     totalLeads,
     atendidosMigracion,
+    enProcesoMigracion,
+    completadosMigracion,
+    atendidosLegal,
+    enProcesoLegal,
+    completadosLegal,
+    enEsperaMigracion,
+    enEsperaLegal,
     sinReplica,
     tagCounts,
     leadsPerDay: leadsPerDay.map(r => ({ day: r.day, count: Number(r.count) })),
